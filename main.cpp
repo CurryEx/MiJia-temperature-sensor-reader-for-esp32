@@ -5,6 +5,7 @@
 #include <PubSubClient.h>
 #include <soc/soc.h>
 #include <soc/rtc_cntl_reg.h>
+#include <esp_task_wdt.h>
 
 static WiFiClient espWifiClient;
 static PubSubClient MQTTClient(espWifiClient);
@@ -29,6 +30,9 @@ bool connectAndRead(BLEAddress address);
 void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic_THB, uint8_t *pData, size_t length, bool isNotify);
 void disconnectDevice();
 void sendMiTHData(int deviceIndex);
+
+// 任务与句柄
+TaskHandle_t *taskHandleReadSensor;
 void taskReadSensor(void *pvParameters);
 
 // todo: wifi ssid 密码
@@ -37,7 +41,7 @@ const char *ssid = "SSID";
 const char *password = "PASSWORD";
 // todo: MQTT服务器地址
 // MQTT Server
-const char *mqttServer = "192.168.31.50";
+const char *mqttServer = "MQTT SERVER";
 // todo: 传感器配置
 // your device
 // MAC, MQTT Topic, temp(default), temp(default) , temp(default)
@@ -62,11 +66,20 @@ char bufJsonData[JSON_BUFFER_SIZE];
 // 最大尝试次数
 const int MAX_RETRY = 3;
 
+// 触发看门狗之后的处理函数
+void esp_task_wdt_isr_user_handler()
+{
+	ESP.restart();
+}
+
 void setup()
 {
 	WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // 关闭低电压检测 避免重启问题
 	Serial.begin(115200);
 	Serial.println("booting");
+
+	// 初始化任务看门狗 设置60秒超时
+	esp_task_wdt_init(100, true);
 
 	// 初始化wifi
 	connectWifi();
@@ -80,7 +93,7 @@ void setup()
 	pClient = BLEDevice::createClient();
 
 	// 开启任务
-	xTaskCreatePinnedToCore(taskReadSensor, "taskReadSensor", 8192, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(taskReadSensor, "taskReadSensor", 8192, NULL, 2, taskHandleReadSensor, 1);
 }
 
 // 连接wifi
@@ -181,6 +194,10 @@ void taskReadSensor(void *pvParameters)
 	int retryCount = 0;
 	for (;;)
 	{
+		// 订阅看门狗
+		esp_task_wdt_add(taskHandleReadSensor);
+
+		// 米家温湿度
 		// 对于每一个address
 		for (indexCurrentSensor = 0; indexCurrentSensor < countHTSensor; indexCurrentSensor++)
 		{
@@ -192,6 +209,9 @@ void taskReadSensor(void *pvParameters)
 			Serial.printf("connecting to %s\n", miTHDevices[indexCurrentSensor].address.c_str());
 			while (!connectAndRead(bleAddress))
 			{
+				// 重置看门狗
+				esp_task_wdt_reset();
+
 				retryCount++;
 				Serial.printf("failed %d times\n", retryCount);
 				if (retryCount >= MAX_RETRY)
@@ -208,6 +228,9 @@ void taskReadSensor(void *pvParameters)
 			// 判断连接状态
 			if (success)
 			{
+				// 重置看门狗
+				esp_task_wdt_reset();
+
 				Serial.println("connected, waiting for notification");
 				// 手动阻塞并设置超时 一般传感器5秒发送一次数据 超时设置为20秒
 				retryCount = 0;
@@ -237,6 +260,9 @@ void taskReadSensor(void *pvParameters)
 			// 每个传感器之间缓一缓
 			delay(2000);
 		}
+
+		// 退订看门狗 进入delay
+		esp_task_wdt_delete(taskHandleReadSensor);
 		delay(publishGap);
 	}
 }
@@ -298,7 +324,8 @@ void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic_THB, uint8
 void disconnectDevice()
 {
 	// 取消notify回调
-	pRemoteCharacteristic_THB->registerForNotify(NULL);
+	if (pRemoteCharacteristic_THB != NULL)
+		pRemoteCharacteristic_THB->registerForNotify(NULL);
 	if (pClient != NULL)
 		if (pClient->isConnected())
 		{
