@@ -11,9 +11,10 @@ static PubSubClient MQTTClient(espWifiClient);
 static BLEClient *pClient;
 static BLERemoteCharacteristic *pRemoteCharacteristic_THB;
 static BLERemoteService *pRemoteService;
-class MiTHDevice
+
+struct MiTHDevice
 {
-public:
+	std::string deviceName;
 	std::string address;
 	std::string topic;
 	float temp;
@@ -23,9 +24,12 @@ public:
 
 void connectWifi();
 void reconnectToMQTT();
-bool connectSensor(BLEAddress address);
+void sendToServer(std::string deviceName, std::string mqttTopic, char *jsonData);
+bool connectAndRead(BLEAddress address);
 void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic_THB, uint8_t *pData, size_t length, bool isNotify);
 void disconnectDevice();
+void sendMiTHData(int deviceIndex);
+void taskReadSensor(void *pvParameters);
 
 // todo: wifi ssid 密码
 // ssid password
@@ -37,48 +41,49 @@ const char *mqttServer = "192.168.31.50";
 // todo: 传感器配置
 // your device
 // MAC, MQTT Topic, temp(default), temp(default) , temp(default)
-static MiTHDevice miTHDevices[] = {
-	{"a4:c1:38:00:00:00", "mqtt/topic1", -1, -1, -1},
-	{"a4:c1:38:00:00:00", "mqtt/topic2", -1, -1, -1}
-};
-// todo: 设备数量
-// device count
-int deviceCount = 2;
-// todo: 控制读取延时 单位 秒
-const unsigned int publishGap = 5 * 60 * 1000;
-bool isCanPublish = false;
+MiTHDevice miTHDevices[] = {
+	{"Mijia01", "a4:c1:38:00:00:00", "device/MiTH01", -1, -1, -1},
+	{"Mijia02", "a4:c1:38:00:00:01", "device/MiTH02", -1, -1, -1}};
+// todo: 温湿度设备数量
+// Mi TH device count
+const int countHTSensor = 2;
+int indexCurrentSensor = -1;
+// todo: 控制读取延时 单位 毫秒
+// todo: publish gap (ms)
+const unsigned int publishGap = 2 * 60 * 1000;
+// const unsigned int publishGap = 5 * 1000;
 // BLE 相关uuid
 const BLEUUID serviceUUID("ebe0ccb0-7a0a-4b0c-8a1a-6ff2997da3a6");
 const BLEUUID charUUID("ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6");
 bool isReceiveNotification = false;
-// mqtt 消息
-#define MSG_BUFFER_SIZE 100
-char MQTTMsg[MSG_BUFFER_SIZE];
-int currentIndex = -1;
-// 双核执行不同的任务
-void core0Task(void *pvParameters);
-void core1Task(void *pvParameters);
+// mqtt 消息buffer
+#define JSON_BUFFER_SIZE 200
+char bufJsonData[JSON_BUFFER_SIZE];
+// 最大尝试次数
+const int MAX_RETRY = 3;
 
 void setup()
 {
-	WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //关闭低电压检测,避免无限重启
+	WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // 关闭低电压检测 避免重启问题
 	Serial.begin(115200);
-	Serial.println("booting MiHTSensor reader");
+	Serial.println("booting");
+
+	// 初始化wifi
 	connectWifi();
-	BLEDevice::init("ESP32");
 
-	//初始化MQTT客户端
+	// 初始化MQTT客户端
 	MQTTClient.setServer(mqttServer, 1883);
+	MQTTClient.loop();
 
-	//初始化BLE客户端
+	// 初始化BLE客户端
+	BLEDevice::init("ESP32");
 	pClient = BLEDevice::createClient();
 
-	//开启双核任务
-	xTaskCreatePinnedToCore(core0Task, "core1Task", 10000, NULL, 2, NULL, 0);
-	xTaskCreatePinnedToCore(core1Task, "core2Task", 10000, NULL, 1, NULL, 1);
+	// 开启任务
+	xTaskCreatePinnedToCore(taskReadSensor, "taskReadSensor", 8192, NULL, 2, NULL, 1);
 }
 
-//连接wifi
+// 连接wifi
 void connectWifi()
 {
 	Serial.println();
@@ -96,8 +101,7 @@ void connectWifi()
 			ESP.restart();
 		}
 	}
-	Serial.print("\n");
-	Serial.println("---wifi connected---");
+	Serial.println("wifi connected");
 }
 
 void reconnectToMQTT()
@@ -105,7 +109,7 @@ void reconnectToMQTT()
 	int retryCount = 0;
 	while (!MQTTClient.connected())
 	{
-		if (retryCount > 15)
+		if (retryCount > MAX_RETRY)
 		{
 			Serial.println("failed to cannect to MQTT, restarting...");
 			ESP.restart();
@@ -129,90 +133,89 @@ void reconnectToMQTT()
 
 void loop()
 {
+	MQTTClient.loop();
+	delay(1000);
 }
 
-// 核心1 做mqtt发布
-void core1Task(void *pvParameters)
+void sendMiTHData(int deviceIndex)
 {
-	while (true)
+	if (miTHDevices[deviceIndex].batt != -1)
 	{
-		if (!MQTTClient.connected())
-		{
-			reconnectToMQTT();
-			continue;
-		}
-		MQTTClient.loop();
+		snprintf(bufJsonData,
+				 JSON_BUFFER_SIZE,
+				 "{\"deviceName\":\"%s\",\"temperature\":\"%.2lf\",\"humidity\":\"%.2lf\",\"battery\":\"%.2lf\"}",
+				 miTHDevices[deviceIndex].deviceName.c_str(),
+				 miTHDevices[deviceIndex].temp,
+				 miTHDevices[deviceIndex].humi,
+				 miTHDevices[deviceIndex].batt);
 
-		if (isCanPublish)
-		{
-			isCanPublish = false;
-			// 判断wifi状态
-			if (WiFi.status() != WL_CONNECTED)
-			{
-				Serial.println("wifi disconnected restarting...");
-				disconnectDevice();
-				ESP.restart();
-			}
-
-			Serial.println("publishing to mqtt server...");
-			for (int i = 0; i < deviceCount; i++)
-			{
-				if (miTHDevices[i].batt == -1)
-					continue;
-				snprintf(MQTTMsg,
-						 MSG_BUFFER_SIZE,
-						 "{\"temperature\":\"%.2lf\",\"humidity\":\"%.2lf\",\"battery\":\"%.2lf\"}",
-						 miTHDevices[i].temp,
-						 miTHDevices[i].humi,
-						 miTHDevices[i].batt);
-				MQTTClient.publish(miTHDevices[i].topic.c_str(), MQTTMsg);
-				Serial.println("Published: ");
-				Serial.println(miTHDevices[i].topic.c_str());
-				Serial.println(MQTTMsg);
-			}
-		}
-		else
-		{
-			delay(1000);
-		}
+		sendToServer(miTHDevices[deviceIndex].deviceName, miTHDevices[deviceIndex].topic, bufJsonData);
 	}
 }
-//核心0用作获取数据
-void core0Task(void *pvParameters)
+
+void sendToServer(std::string deviceName, std::string mqttTopic, char *jsonData)
 {
-	while (true)
+	if (!WiFi.isConnected())
 	{
-		//对于每一个address
-		for (int i = 0; i < deviceCount; i++)
+		Serial.println("WIFI disconnected, reconnecting...");
+		connectWifi();
+	}
+
+	if (!MQTTClient.connected())
+	{
+		reconnectToMQTT();
+	}
+
+	Serial.println("publishing to server...");
+	MQTTClient.publish(mqttTopic.c_str(), jsonData);
+
+	Serial.println("sent: ");
+	Serial.printf("deviceName: %s\n", deviceName.c_str());
+	Serial.printf("mqttTopic: %s\n", mqttTopic.c_str());
+	Serial.printf("jsonData: %s\n", jsonData);
+}
+
+void taskReadSensor(void *pvParameters)
+{
+	char co2Buffer[100] = {0};
+	int retryCount = 0;
+	for (;;)
+	{
+		// 对于每一个address
+		for (indexCurrentSensor = 0; indexCurrentSensor < countHTSensor; indexCurrentSensor++)
 		{
-			currentIndex = i;
-			int retryCount = 0;
+			retryCount = 0;
 			bool success = true;
-			Serial.printf("connecting to %s\n", miTHDevices[i].address.c_str());
-			BLEAddress bleAddress(miTHDevices[i].address);
-			//尝试三次连接
-			while (!connectSensor(bleAddress))
+			isReceiveNotification = false;
+			BLEAddress bleAddress(miTHDevices[indexCurrentSensor].address);
+			// 尝试三次连接
+			Serial.printf("connecting to %s\n", miTHDevices[indexCurrentSensor].address.c_str());
+			while (!connectAndRead(bleAddress))
 			{
 				retryCount++;
-				if (retryCount >= 3)
+				Serial.printf("failed %d times\n", retryCount);
+				if (retryCount >= MAX_RETRY)
 				{
 					success = false;
-					Serial.println("---all 3 times failed---");
+					Serial.println("all 3 times failed");
 					break;
 				}
-				delay(5000);
+				else
+				{
+					delay(5000);
+				}
 			}
-			//判断连接状态
+			// 判断连接状态
 			if (success)
 			{
-				Serial.println("sensor connected, waiting for notification");
-				//"阻塞"与超时
+				Serial.println("connected, waiting for notification");
+				// 手动阻塞并设置超时 一般传感器5秒发送一次数据 超时设置为20秒
 				retryCount = 0;
 				while (!isReceiveNotification)
 				{
 					delay(1000);
 					retryCount++;
-					//超时未响应
+					// 超时
 					if (retryCount >= 20)
 					{
 						Serial.println("there is no reply from sensor, disconnecting");
@@ -220,54 +223,48 @@ void core0Task(void *pvParameters)
 						break;
 					}
 				}
-				//运行到这里说明已经好了
+				// 接收到了notify就发送给mqtt
+				if (isReceiveNotification)
+				{
+					sendMiTHData(indexCurrentSensor);
+				}
 
 				if (pClient->isConnected())
 				{
 					disconnectDevice();
-					do
-					{
-						delay(1000);
-					} while (pClient->isConnected());
 				}
 			}
-			//每个传感器之间缓一缓
-			delay(1000);
-			if (i + 1 == deviceCount)
-			{
-				isCanPublish = true;
-				delay(publishGap);
-			}
+			// 每个传感器之间缓一缓
+			delay(2000);
 		}
+		delay(publishGap);
 	}
 }
 
-bool connectSensor(BLEAddress address)
+bool connectAndRead(BLEAddress address)
 {
-	pClient->connect(address);
-	if (pClient->isConnected() == true)
+	if (pClient->connect(address) == true)
 	{
-		Serial.print("connected to ");
-		Serial.print(pClient->getPeerAddress().toString().c_str());
-		Serial.printf("\nsignal strength= %d \n", pClient->getRssi());
+		Serial.printf("signal strength %d \n", pClient->getRssi());
 
 		pRemoteService = pClient->getService(serviceUUID);
 		if (pRemoteService == nullptr)
 		{
 			Serial.print("connection broken: fail to get service");
-			pClient->disconnect();
+			if (pClient->isConnected())
+				pClient->disconnect();
 			return false;
 		}
 		pRemoteCharacteristic_THB = pRemoteService->getCharacteristic(charUUID);
 		if (pRemoteCharacteristic_THB == nullptr)
 		{
-			Serial.print("connection broken: fail to get characteristic THB");
-			pClient->disconnect();
+			Serial.print("connection broken: fail to get characteristic");
+			if (pClient->isConnected())
+				pClient->disconnect();
 			return false;
 		}
 		else
 		{
-			isReceiveNotification = false;
 			pRemoteCharacteristic_THB->registerForNotify(notifyCallback);
 			return true;
 		}
@@ -279,7 +276,7 @@ bool connectSensor(BLEAddress address)
 	}
 }
 
-//收到notification之后的回调
+// 收到notification之后的回调
 void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic_THB, uint8_t *pData, size_t length, bool isNotify)
 {
 	Serial.println("data received");
@@ -287,18 +284,29 @@ void notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic_THB, uint8
 	temp = (pData[0] | (pData[1] << 8)) * 0.01;
 	humi = pData[2];
 	batt = (pData[3] | (pData[4] << 8)) * 0.001;
-	Serial.printf("TEMP %.2f C - HUMI %.2f %% - BATT= %.3f V - free heap= %d\n", temp, humi, batt, esp_get_free_heap_size());
-	miTHDevices[currentIndex].temp = temp;
-	miTHDevices[currentIndex].humi = humi;
-	miTHDevices[currentIndex].batt = batt;
+	Serial.printf("DEVICE %s TEMP %.2f C - HUMI %.2f %% - BATT= %.3f V - free heap= %d\n",
+				  miTHDevices[indexCurrentSensor].deviceName.c_str(),
+				  temp,
+				  humi,
+				  batt, esp_get_free_heap_size());
+	miTHDevices[indexCurrentSensor].temp = temp;
+	miTHDevices[indexCurrentSensor].humi = humi;
+	miTHDevices[indexCurrentSensor].batt = batt;
 	isReceiveNotification = true;
 }
 
 void disconnectDevice()
 {
-	uint8_t val[] = {0x00, 0x00};
-	pRemoteCharacteristic_THB->getDescriptor((uint16_t)0x2902)->writeValue(val, 2, true);
+	// 取消notify回调
+	pRemoteCharacteristic_THB->registerForNotify(NULL);
 	if (pClient != NULL)
 		if (pClient->isConnected())
+		{
 			pClient->disconnect();
+			do
+			{
+				delay(1000);
+			} while (pClient->isConnected());
+			Serial.println("disconnected");
+		}
 }
